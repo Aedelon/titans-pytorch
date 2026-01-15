@@ -114,6 +114,9 @@ class TrainingConfig:
     grad_clip: float = 1.0
     warmup_ratio: float = 0.03
 
+    # Mixed precision
+    dtype: str = "float16"  # float32, float16, bfloat16
+
     # Checkpointing
     checkpoint_dir: str = "checkpoints_mlx"
     save_every: int = 1000  # Save every N steps
@@ -961,6 +964,15 @@ def main() -> None:
     parser.add_argument("--wandb-project", type=str, default="titans-mlx")
     parser.add_argument("--wandb-run-name", type=str, default=None)
 
+    # Mixed precision
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float16",
+        choices=["float32", "float16", "bfloat16"],
+        help="Data type for training (float16/bfloat16 for mixed precision)",
+    )
+
     # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
@@ -1005,6 +1017,7 @@ def main() -> None:
         wandb_run_name=args.wandb_run_name,
         seed=args.seed,
         synthetic_samples=args.synthetic_samples,
+        dtype=args.dtype,
     )
 
     # Check dependencies
@@ -1042,11 +1055,44 @@ def main() -> None:
         use_conv=False,  # Disable conv to avoid dimension issues
     )
 
+    # Configure dtype for mixed precision
+    dtype_map = {
+        "float32": mx.float32,
+        "float16": mx.float16,
+        "bfloat16": mx.bfloat16,
+    }
+    train_dtype = dtype_map[config.dtype]
+
     # Create model
     model = create_model(config.model_type, model_config)
+
+    # Convert model to target dtype for mixed precision
+    if config.dtype != "float32":
+        logger.info(f"Converting model to {config.dtype} for mixed precision training")
+
+        def convert_dtype(params):
+            """Recursively convert parameters to target dtype."""
+            result = {}
+            for k, v in params.items():
+                if isinstance(v, mx.array):
+                    # Keep embedding weights in float32 for stability
+                    if "embed" in k:
+                        result[k] = v
+                    else:
+                        result[k] = v.astype(train_dtype)
+                elif isinstance(v, dict):
+                    result[k] = convert_dtype(v)
+                else:
+                    result[k] = v
+            return result
+
+        model.update(convert_dtype(model.parameters()))
+        mx.eval(model.parameters())
+
     total_params = count_parameters(model)
     logger.info(f"Model: Titans{config.model_type.upper()} (MLX)")
     logger.info(f"Total parameters: {total_params:,} ({total_params / 1e6:.1f}M)")
+    logger.info(f"Training dtype: {config.dtype}")
 
     # Create optimizer (AdamW as in paper)
     optimizer = optim.AdamW(

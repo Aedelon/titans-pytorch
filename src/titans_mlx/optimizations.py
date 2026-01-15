@@ -37,6 +37,28 @@ def compile_function(fn: Callable) -> Callable:
     return mx.compile(fn)
 
 
+def compile_model(model: nn.Module) -> nn.Module:
+    """Note: Full model compilation is not currently supported.
+
+    mx.compile cannot compile Titans models because they use:
+    - MemoryState dataclasses (Python objects not supported)
+    - Dynamic Python loops for chunk processing
+    - Mutable state updates
+
+    The models are already well-optimized for MLX. For additional speedups:
+    1. Use larger batch sizes to amortize overhead
+    2. Process longer sequences (more compute per call)
+    3. Use float16 precision: mx.set_default_dtype(mx.float16)
+
+    Returns the original model unchanged.
+
+    For component-level compilation, use compile_function on individual
+    operations like FeedForward or attention modules.
+    """
+    # Return model unchanged - compilation not supported
+    return model
+
+
 @lru_cache(maxsize=32)
 def get_causal_mask(seq_len: int) -> mx.array:
     """Get cached causal mask for a given sequence length.

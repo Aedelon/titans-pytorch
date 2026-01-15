@@ -526,13 +526,18 @@ class MetalRMSNorm(nn.Module):
 
 
 class MetalFeedForward(nn.Module):
-    """Feed-forward network using Metal-optimized gating."""
+    """Feed-forward network with SiLU gating.
+
+    Note: Native MLX implementation is faster than custom Metal kernel
+    for typical tensor sizes. The metal_kernel option is kept for
+    benchmarking purposes only.
+    """
 
     def __init__(
         self,
         dim: int,
         hidden_dim: int,
-        use_metal_kernel: bool = True,
+        use_metal_kernel: bool = False,  # Native is faster
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -544,11 +549,12 @@ class MetalFeedForward(nn.Module):
         self.down_proj = nn.Linear(hidden_dim, dim, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        """Forward pass with optional Metal kernel."""
+        """Forward pass with SiLU gating (native by default)."""
         gate = self.gate_proj(x)
         up = self.up_proj(x)
 
         if self.use_metal_kernel:
+            # Only for benchmarking - native is faster
             hidden = metal_silu_gate(gate, up)
         else:
             hidden = nn.silu(gate) * up
