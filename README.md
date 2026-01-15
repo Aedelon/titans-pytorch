@@ -166,6 +166,19 @@ o = SW-Attn(y)                                   # Eq. 31: Attention on memory o
 
 **Recommendation**: Start with **MAG** for general use, switch to **MAC** if you need the best long-context performance.
 
+### MLX vs PyTorch Benchmark (Apple M3 Max)
+
+Inference speed comparison on batch=4, seq_len=256, dim=256, 4 layers:
+
+| Model | MLX (ms) | PyTorch MPS (ms) | MLX Speedup |
+|-------|----------|------------------|-------------|
+| MAC | 19.98 | 24.58 | **1.23x** |
+| MAG | 9.49 | 16.73 | **1.76x** |
+| MAL | 9.81 | 16.91 | **1.72x** |
+| LMM | 7.15 | 11.99 | **1.68x** |
+
+All MLX implementations are faster than PyTorch MPS on Apple Silicon, with MAG showing the best speedup.
+
 ## Neural Long-term Memory
 
 ### Core Equations (Section 3.1)

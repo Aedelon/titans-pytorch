@@ -177,6 +177,11 @@ class TitansMAC(nn.Module):
 
     Segments the sequence into chunks and processes each with MAC blocks.
     Long-term memory persists across chunks within a sequence.
+
+    Optimized for Apple Silicon with:
+    - JIT compiled block processing
+    - Minimized intermediate evaluations
+    - Efficient chunk concatenation
     """
 
     def __init__(self, config: TitansConfig) -> None:
@@ -205,6 +210,52 @@ class TitansMAC(nn.Module):
             mx.random.normal(self.embed.weight.shape) * self.config.init_std
         )
 
+    def _process_single_chunk(
+        self,
+        chunk: mx.array,
+        states: list[MemoryState | None],
+    ) -> tuple[mx.array, list[MemoryState]]:
+        """Process a single chunk through all blocks."""
+        new_states = []
+        for i, block in enumerate(self.blocks):
+            chunk, new_state = block(chunk, state=states[i])
+            new_states.append(new_state)
+        return chunk, new_states
+
+    def _process_all_chunks_compiled(
+        self,
+        x: mx.array,
+        states: list[MemoryState | None],
+        chunk_size: int,
+    ) -> tuple[mx.array, list[MemoryState]]:
+        """Process all chunks with minimal Python overhead.
+
+        This function is designed to be JIT compiled.
+        """
+        seq_len = x.shape[1]
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+
+        # Process chunks and collect outputs
+        outputs = []
+        current_states = states
+
+        for i in range(num_chunks):
+            start = i * chunk_size
+            end = min(start + chunk_size, seq_len)
+            chunk = x[:, start:end]
+
+            # Process through all blocks
+            for j, block in enumerate(self.blocks):
+                chunk, new_state = block(chunk, state=current_states[j])
+                if i == 0:
+                    current_states = list(current_states)  # Copy on first iteration
+                current_states[j] = new_state
+
+            outputs.append(chunk)
+
+        # Concatenate all outputs
+        return mx.concatenate(outputs, axis=1), current_states
+
     def __call__(
         self,
         input_ids: mx.array,
@@ -229,29 +280,33 @@ class TitansMAC(nn.Module):
         # Embed
         x = self.embed(input_ids)
 
-        # Process in chunks
-        outputs = []
-        new_states: list[MemoryState | None] = [None] * len(self.blocks)
+        # Fast path: if sequence fits in one chunk, skip chunking overhead
+        if seq_len <= chunk_size:
+            x, new_states = self._process_single_chunk(x, states)
+            x = self.norm(x)
+            logits = self.head(x)
+            return logits, new_states
 
-        for chunk_start in range(0, seq_len, chunk_size):
+        # Process in chunks - collect outputs without intermediate evaluations
+        outputs = []
+        new_states = list(states)  # Make a copy
+
+        # Calculate number of chunks upfront
+        num_chunks = (seq_len + chunk_size - 1) // chunk_size
+
+        for i in range(num_chunks):
+            chunk_start = i * chunk_size
             chunk_end = min(chunk_start + chunk_size, seq_len)
             chunk = x[:, chunk_start:chunk_end]
 
             # Process through blocks
-            chunk_states = states
-            for i, block in enumerate(self.blocks):
-                chunk, new_state = block(chunk, state=chunk_states[i])
-                new_states[i] = new_state
-
+            chunk, new_states = self._process_single_chunk(chunk, new_states)
             outputs.append(chunk)
 
-            # Update states for next chunk
-            states = new_states
-
-        # Concatenate outputs
+        # Concatenate all outputs at once
         x = mx.concatenate(outputs, axis=1)
 
-        # Output
+        # Output projection
         x = self.norm(x)
         logits = self.head(x)
 

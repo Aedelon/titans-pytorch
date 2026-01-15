@@ -264,7 +264,12 @@ class NeuralLongTermMemory(nn.Module):
         values: mx.array,
         weights: list[mx.array],
     ) -> list[mx.array]:
-        """Compute gradients for memory update using MLX's grad.
+        """Compute gradients for memory update analytically.
+
+        Optimized implementation that minimizes Python overhead.
+
+        For the loss ||M(k) - v||^2, we compute gradients analytically
+        to avoid nested mx.grad calls which cause VJP issues.
 
         Args:
             keys: Key vectors (batch, seq, dim)
@@ -274,19 +279,96 @@ class NeuralLongTermMemory(nn.Module):
         Returns:
             List of gradient tensors for each memory layer
         """
-        # Set weights
-        self.memory.set_weights(weights)
+        num_layers = len(weights)
 
-        # Define loss function for gradient computation
-        def loss_fn(weights_flat: list[mx.array]) -> mx.array:
-            # Temporarily set weights
-            for layer, w in zip(self.memory.layers, weights_flat):
-                layer.weight = w
-            return self.memory.compute_loss(keys, values)
+        # Fast path for linear memory (1 layer) - most common case
+        if num_layers == 1:
+            return self._compute_gradients_linear(keys, values, weights[0])
 
-        # Compute gradients using MLX's grad
-        grad_fn = mx.grad(loss_fn)
-        grads = grad_fn(weights)
+        # Multi-layer case: use optimized computation
+        return self._compute_gradients_deep(keys, values, weights)
+
+    def _compute_gradients_linear(
+        self,
+        keys: mx.array,
+        values: mx.array,
+        weight: mx.array,
+    ) -> list[mx.array]:
+        """Optimized gradient computation for linear (1-layer) memory.
+
+        For M(k) = W @ k, the gradient is:
+            dL/dW = 2/n * sum((W @ k - v) @ k^T)
+
+        Uses matmul instead of expand_dims for efficiency.
+        """
+        # Forward pass: predictions = keys @ W^T
+        predictions = keys @ weight.T
+
+        # Error and gradient scale
+        error = mx.clip(predictions - values, -10.0, 10.0)
+        scale = 2.0 / float(error.size)
+
+        # Efficient gradient via matmul: (D_out, B*S) @ (B*S, D_in) -> (D_out, D_in)
+        # Flatten batch and seq dims, then use matmul instead of outer product
+        batch_seq = error.shape[0] * error.shape[1]
+        error_flat = error.reshape(batch_seq, -1)  # (B*S, D_out)
+        keys_flat = keys.reshape(batch_seq, -1)    # (B*S, D_in)
+        grad_w = scale * (error_flat.T @ keys_flat)  # (D_out, D_in)
+
+        return [mx.clip(grad_w, -1.0, 1.0)]
+
+    def _compute_gradients_deep(
+        self,
+        keys: mx.array,
+        values: mx.array,
+        weights: list[mx.array],
+    ) -> list[mx.array]:
+        """Optimized gradient computation for deep (multi-layer) memory.
+
+        Uses matmul instead of expand_dims for efficient gradient computation.
+        """
+        num_layers = len(weights)
+        batch_size, seq_len = keys.shape[0], keys.shape[1]
+        batch_seq = batch_size * seq_len
+
+        # Forward pass - collect activations
+        activations = [keys]
+        pre_activations = []
+        h = keys
+
+        for i in range(num_layers):
+            h_pre = h @ weights[i].T
+            pre_activations.append(h_pre)
+            if i < num_layers - 1:
+                h = self.memory.activation(h_pre)
+                activations.append(h)
+            else:
+                h = h_pre
+
+        # Error computation
+        error = mx.clip(h - values, -10.0, 10.0)
+        scale = 2.0 / float(error.size)
+        delta = scale * error
+
+        # Backward pass - compute gradients using efficient matmul
+        grads = [None] * num_layers
+
+        for i in range(num_layers - 1, -1, -1):
+            act = activations[i]
+
+            # Efficient gradient via matmul: (D_out, B*S) @ (B*S, D_in) -> (D_out, D_in)
+            delta_flat = delta.reshape(batch_seq, -1)  # (B*S, D_out)
+            act_flat = act.reshape(batch_seq, -1)      # (B*S, D_in)
+            grad_w = delta_flat.T @ act_flat           # (D_out, D_in)
+            grads[i] = mx.clip(grad_w, -1.0, 1.0)
+
+            # Propagate gradient to previous layer
+            if i > 0:
+                delta = delta @ weights[i]
+                # SiLU gradient: sig * (1 + x * (1 - sig))
+                x = pre_activations[i - 1]
+                sig = mx.sigmoid(x)
+                delta = delta * sig * (1.0 + x * (1.0 - sig))
 
         return grads
 
