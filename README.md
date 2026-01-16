@@ -873,15 +873,6 @@ uv run ruff check src/ tests/ scripts/
 uv run ruff format src/ tests/ scripts/
 ```
 
-### Profiling
-
-```bash
-# Profile training to identify bottlenecks
-uv run python scripts/profile_training.py \
-    --model mac --dim 256 --num-layers 4 \
-    --batch-size 4 --num-steps 50
-```
-
 ---
 
 ## Citation
