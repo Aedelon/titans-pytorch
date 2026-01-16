@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +44,22 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from tqdm import tqdm
+
+# CUDA optimizations - set before any CUDA operations
+if torch.cuda.is_available():
+    # Auto-tune convolution algorithms for hardware
+    torch.backends.cudnn.benchmark = True
+    # Use TF32 for faster matmul on Ampere+ GPUs (slight precision loss, big speedup)
+    torch.set_float32_matmul_precision('high')
+    # Optimize memory allocator
+    torch.cuda.set_per_process_memory_fraction(0.95)
+
+# torch.compile optimizations
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 256
+torch._dynamo.config.suppress_errors = True
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", ".cache/torch_compile")
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
 
 from titans import TitansConfig, TitansLMM, TitansMAC, TitansMAG, TitansMAL
 
@@ -64,7 +81,7 @@ except ImportError:
     PreTrainedTokenizerBase = Any  # type: ignore
 
 try:
-    from datasets import load_dataset
+    from datasets import load_dataset, load_from_disk
 
     HAS_DATASETS = True
 except ImportError:
@@ -107,6 +124,7 @@ class DistributedTrainingConfig:
     # Data
     dataset: str | None = None
     dataset_subset: str | None = None
+    local_dataset: str | None = None  # Pre-tokenized local dataset
     data_path: str | None = None
     tokenizer: str = "gpt2"
     seq_len: int = 4096
@@ -250,6 +268,42 @@ class StreamingDataset(IterableDataset):
                 }
 
 
+class LocalHFDataset(Dataset):
+    """Dataset from pre-tokenized local HuggingFace dataset (Arrow format)."""
+
+    def __init__(self, path: str | Path, seq_len: int) -> None:
+        self.seq_len = seq_len
+
+        # Load dataset (Arrow memory-mapped)
+        logger.info(f"Loading local dataset from {path}")
+        self.dataset = load_from_disk(path)
+        num_samples = len(self.dataset)
+        logger.info(f"Loaded {num_samples} samples (Arrow memory-mapped)")
+
+        # Check if already pre-tokenized
+        first_example = self.dataset[0]
+        self.is_pretokenized = "input_ids" in first_example and isinstance(
+            first_example["input_ids"], (list, tuple)
+        )
+
+        if self.is_pretokenized:
+            logger.info("Dataset is pre-tokenized, ready for training")
+        else:
+            raise ValueError(
+                "Raw text datasets not supported. Use pretokenize.py first."
+            )
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        tokens = torch.tensor(self.dataset[idx]["input_ids"], dtype=torch.long)
+        return {
+            "input_ids": tokens[:-1],
+            "labels": tokens[1:],
+        }
+
+
 # =============================================================================
 # Model Creation
 # =============================================================================
@@ -314,12 +368,19 @@ class DistributedTrainer:
             else:
                 logger.warning("Model does not support gradient checkpointing")
 
-        # Optimizer
+        # Optimizer (use fused=True for faster GPU execution)
+        optimizer_kwargs = {
+            "lr": config.lr,
+            "weight_decay": config.weight_decay,
+            "betas": (0.9, 0.95),
+        }
+        if torch.cuda.is_available():
+            optimizer_kwargs["fused"] = True
+            logger.info("Using fused AdamW optimizer (GPU-accelerated)")
+
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-            betas=(0.9, 0.95),
+            **optimizer_kwargs,
         )
 
         # Calculate total steps
@@ -411,7 +472,7 @@ class DistributedTrainer:
 
             self.optimizer.step()
             self.scheduler.step()
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
         return {"loss": loss.item(), "ppl": math.exp(loss.item())}
 
@@ -609,6 +670,7 @@ def main() -> None:
     # Data
     parser.add_argument("--dataset", type=str, default=None)
     parser.add_argument("--dataset-subset", type=str, default=None)
+    parser.add_argument("--local-dataset", type=str, default=None, help="Pre-tokenized local dataset (Arrow format)")
     parser.add_argument("--data", type=str, default=None)
     parser.add_argument("--tokenizer", type=str, default="gpt2")
     parser.add_argument("--seq-len", type=int, default=4096)
@@ -661,6 +723,7 @@ def main() -> None:
         vocab_size=args.vocab_size,
         dataset=args.dataset,
         dataset_subset=args.dataset_subset,
+        local_dataset=args.local_dataset,
         data_path=args.data,
         tokenizer=args.tokenizer,
         seq_len=args.seq_len,
@@ -694,8 +757,10 @@ def main() -> None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
         config.vocab_size = tokenizer.vocab_size
 
-    # Create dataset
-    if config.dataset and HAS_DATASETS:
+    # Create dataset (prioritize local pre-tokenized dataset)
+    if config.local_dataset and HAS_DATASETS:
+        train_dataset = LocalHFDataset(config.local_dataset, config.seq_len)
+    elif config.dataset and HAS_DATASETS:
         train_dataset = StreamingDataset(
             config.dataset,
             tokenizer,
