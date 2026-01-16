@@ -42,17 +42,29 @@ class RotaryPositionEmbedding(nn.Module):
         # Precompute cos and sin for efficiency
         self._build_cache(max_seq_len)
 
-    def _build_cache(self, seq_len: int) -> None:
-        """Build cos/sin cache for given sequence length."""
-        positions = torch.arange(seq_len, dtype=torch.float32)
-        freqs = torch.outer(positions, self.inv_freq)
+    def _build_cache(
+        self, seq_len: int, device: torch.device | None = None, dtype: torch.dtype | None = None
+    ) -> None:
+        """Build cos/sin cache for given sequence length, device, and dtype."""
+        inv_freq = self.inv_freq
+        if device is not None:
+            inv_freq = inv_freq.to(device)
 
-        # Compute cos and sin
+        positions = torch.arange(seq_len, device=inv_freq.device, dtype=torch.float32)
+        freqs = torch.outer(positions, inv_freq.float())
+
+        # Compute cos and sin in target dtype
         cos = freqs.cos()
         sin = freqs.sin()
 
+        if dtype is not None:
+            cos = cos.to(dtype)
+            sin = sin.to(dtype)
+
         self.register_buffer("cos_cached", cos, persistent=False)
         self.register_buffer("sin_cached", sin, persistent=False)
+        self._cache_dtype = dtype
+        self._cache_device = device
 
     def forward(
         self,
@@ -73,12 +85,18 @@ class RotaryPositionEmbedding(nn.Module):
         seq_len = q.shape[2]
         device = q.device
 
-        # Get cached cos/sin or recompute if needed
-        if seq_offset + seq_len > self.max_seq_len:
-            self._build_cache(seq_offset + seq_len)
+        # Rebuild cache if needed (length, device, or dtype changed)
+        need_rebuild = (
+            seq_offset + seq_len > self.cos_cached.shape[0]
+            or getattr(self, "_cache_device", None) != device
+            or getattr(self, "_cache_dtype", None) != q.dtype
+        )
+        if need_rebuild:
+            self._build_cache(max(seq_offset + seq_len, self.max_seq_len), device, q.dtype)
 
-        cos = self.cos_cached[seq_offset : seq_offset + seq_len].to(device)
-        sin = self.sin_cached[seq_offset : seq_offset + seq_len].to(device)
+        # Get cached cos/sin - already in correct dtype/device
+        cos = self.cos_cached[seq_offset : seq_offset + seq_len]
+        sin = self.sin_cached[seq_offset : seq_offset + seq_len]
 
         # Apply rotation
         q_rotated = self._apply_rotary(q, cos, sin)

@@ -75,3 +75,9 @@ datasets/
 .env
 .env.*
 secrets.yaml
+
+# Cache
+.cache/
+
+# Profiling
+profiler_logs/

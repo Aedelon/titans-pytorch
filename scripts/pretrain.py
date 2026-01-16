@@ -47,6 +47,26 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from tqdm import tqdm
 
+# CUDA optimizations - set before any CUDA operations
+if torch.cuda.is_available():
+    # Auto-tune convolution algorithms for hardware
+    torch.backends.cudnn.benchmark = True
+    # Use TF32 for faster matmul on Ampere+ GPUs (slight precision loss, big speedup)
+    torch.set_float32_matmul_precision('high')
+    # Optimize memory allocator
+    torch.cuda.set_per_process_memory_fraction(0.95)  # Use more GPU memory
+
+# torch.compile optimizations - set before compilation
+import torch._dynamo
+# Cache compiled graphs to disk for faster startup
+torch._dynamo.config.cache_size_limit = 256
+# Suppress errors and fallback to eager mode for unsupported ops
+torch._dynamo.config.suppress_errors = True
+# Enable persistent cache directory
+import os
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", ".cache/torch_compile")
+os.environ.setdefault("TORCHINDUCTOR_FX_GRAPH_CACHE", "1")
+
 from titans import TitansConfig, TitansLMM, TitansMAC, TitansMAG, TitansMAL
 
 # CUDA optimizations
@@ -244,9 +264,8 @@ class CharLevelDataset(Dataset):
 class LocalHFDataset(Dataset):
     """Dataset from a local HuggingFace dataset saved with save_to_disk().
 
-    Supports two formats:
-    1. Pre-tokenized: dataset has 'input_ids' field (from pretokenize.py)
-    2. Raw text: dataset has 'text' field (will tokenize on load)
+    Uses Arrow memory-mapping for efficient disk access.
+    Linux kernel handles caching automatically.
     """
 
     def __init__(
@@ -260,13 +279,11 @@ class LocalHFDataset(Dataset):
 
         self.seq_len = seq_len
 
-        # Load dataset from disk
+        # Load dataset (Arrow memory-mapped)
         logger.info(f"Loading local dataset from {path}")
         self.dataset = load_from_disk(path)
-
-        # Shuffle
-        self.dataset = self.dataset.shuffle(seed=seed)
-        logger.info(f"Loaded {len(self.dataset)} samples")
+        num_samples = len(self.dataset)
+        logger.info(f"Loaded {num_samples} samples (Arrow memory-mapped)")
 
         # Check if already pre-tokenized
         first_example = self.dataset[0]
@@ -275,59 +292,22 @@ class LocalHFDataset(Dataset):
         )
 
         if self.is_pretokenized:
-            # Already tokenized - use directly (fast path)
-            logger.info("Dataset is pre-tokenized, using directly (fast path)")
-            self.tokens_list = None  # Use self.dataset directly
+            logger.info("Dataset is pre-tokenized, ready for training")
         else:
-            # Need to tokenize (slow path)
-            if tokenizer is None:
-                raise ValueError("Tokenizer required for non-pretokenized datasets")
-
-            logger.info("Dataset is raw text, tokenizing...")
-            self.tokens_list = []
-            buffer = []
-
-            for i, example in enumerate(self.dataset):
-                text = example.get("text") or example.get("content") or str(example)
-                tokens = tokenizer.encode(text, add_special_tokens=False)
-                buffer.extend(tokens)
-
-                # Create samples from buffer
-                while len(buffer) >= seq_len + 1:
-                    self.tokens_list.append(
-                        torch.tensor(buffer[: seq_len + 1], dtype=torch.long)
-                    )
-                    buffer = buffer[seq_len:]  # Non-overlapping for efficiency
-
-                if (i + 1) % 50000 == 0:
-                    logger.info(
-                        f"  Processed {i+1} samples, created {len(self.tokens_list)} sequences"
-                    )
-
-            logger.info(f"Created {len(self.tokens_list)} training sequences")
+            # Need to tokenize - not supported in this mode
+            raise ValueError(
+                "Raw text datasets not supported. Use pretokenize.py first."
+            )
 
     def __len__(self) -> int:
-        if self.is_pretokenized:
-            return len(self.dataset)
-        return len(self.tokens_list)
+        return len(self.dataset)
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
-        if self.is_pretokenized:
-            # Pre-tokenized: input_ids already contains seq_len+1 tokens
-            tokens = self.dataset[idx]["input_ids"]
-            if not isinstance(tokens, torch.Tensor):
-                tokens = torch.tensor(tokens, dtype=torch.long)
-            return {
-                "input_ids": tokens[:-1],
-                "labels": tokens[1:],
-            }
-        else:
-            # Tokenized on load
-            tokens = self.tokens_list[idx]
-            return {
-                "input_ids": tokens[:-1],
-                "labels": tokens[1:],
-            }
+        tokens = torch.tensor(self.dataset[idx]["input_ids"], dtype=torch.long)
+        return {
+            "input_ids": tokens[:-1],
+            "labels": tokens[1:],
+        }
 
 
 class StreamingDataset(IterableDataset):
@@ -475,20 +455,39 @@ class Trainer:
             else:
                 device = torch.device("cpu")
         self.device = device
-        self.model = self.model.to(self.device)
+
+        # Initialize model in target dtype to avoid autocast conversions
+        if config.mixed_precision == "bf16":
+            logger.info("Initializing model in bfloat16 (no autocast overhead)")
+            self.model = self.model.to(device=self.device, dtype=torch.bfloat16)
+            self.model_dtype = torch.bfloat16
+        elif config.mixed_precision == "fp16":
+            logger.info("Initializing model in float16")
+            self.model = self.model.to(device=self.device, dtype=torch.float16)
+            self.model_dtype = torch.float16
+        else:
+            self.model = self.model.to(self.device)
+            self.model_dtype = torch.float32
 
         # Apply torch.compile for faster training (PyTorch 2.0+)
         if config.use_torch_compile and hasattr(torch, "compile") and self.device.type == "cuda":
             logger.info(f"Applying torch.compile (mode={config.compile_mode})")
+            logger.info("First iteration will be slow (compilation), then cached for future runs")
             try:
+                # Compile options for maximum performance:
+                # - mode="reduce-overhead": Minimizes CPU overhead (best for training)
+                # - backend="inductor": CUDA-optimized backend with kernel fusion
+                # - dynamic=False: Static shapes = faster compilation & execution
+                # - fullgraph=False: Allow graph breaks for compatibility
                 self.model = torch.compile(
                     self.model,
                     mode=config.compile_mode,
+                    backend="inductor",
                     fullgraph=False,
-                    dynamic=True,
+                    dynamic=False,  # Static shapes for faster compile
                 )
             except Exception as e:
-                logger.warning(f"torch.compile failed: {e}")
+                logger.warning(f"torch.compile failed: {e}, falling back to eager mode")
 
         # Configure CUDA memory pool
         if HAS_CUDA_OPTS and self.device.type == "cuda":
@@ -503,12 +502,20 @@ class Trainer:
                 "with checkpointing. Ignoring --gradient-checkpointing flag."
             )
 
-        # Optimizer (AdamW as in paper)
+        # Optimizer (AdamW as in paper) - use fused=True for faster GPU execution
+        optimizer_kwargs = {
+            "lr": config.lr,
+            "weight_decay": config.weight_decay,
+            "betas": (0.9, 0.95),
+        }
+        # Fused AdamW runs entirely on GPU, much faster
+        if self.device.type == "cuda":
+            optimizer_kwargs["fused"] = True
+            logger.info("Using fused AdamW optimizer (GPU-accelerated)")
+
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
-            lr=config.lr,
-            weight_decay=config.weight_decay,
-            betas=(0.9, 0.95),  # Common for LLMs
+            **optimizer_kwargs,
         )
 
         # Calculate total steps
@@ -526,14 +533,11 @@ class Trainer:
             self.optimizer, num_warmup_steps, self.total_steps
         )
 
-        # Mixed precision
+        # Mixed precision - only use scaler for fp16, bf16 doesn't need it
+        # Model is already in target dtype, no autocast needed
         self.scaler = None
-        self.autocast_dtype = None
         if config.mixed_precision == "fp16" and self.device.type == "cuda":
             self.scaler = torch.amp.GradScaler("cuda")
-            self.autocast_dtype = torch.float16
-        elif config.mixed_precision == "bf16":
-            self.autocast_dtype = torch.bfloat16
 
         # State
         self.global_step = 0
@@ -555,27 +559,17 @@ class Trainer:
     def train_step(
         self, batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        """Single training step with mixed precision."""
+        """Single training step - model already in target dtype, no autocast needed."""
         # Use non_blocking=True to overlap CPU->GPU transfer with computation
         input_ids = batch["input_ids"].to(self.device, non_blocking=True)
         labels = batch["labels"].to(self.device, non_blocking=True)
 
-        # Forward pass with autocast
-        if self.autocast_dtype is not None:
-            with torch.autocast(
-                device_type=self.device.type, dtype=self.autocast_dtype
-            ):
-                logits, _ = self.model(input_ids)
-                loss = nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1),
-                )
-        else:
-            logits, _ = self.model(input_ids)
-            loss = nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                labels.view(-1),
-            )
+        # Forward pass - model already in bf16/fp16, no autocast overhead
+        logits, _ = self.model(input_ids)
+        loss = nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+        )
 
         # Scale loss for gradient accumulation
         scaled_loss = loss / self.config.gradient_accumulation_steps
@@ -627,7 +621,7 @@ class Trainer:
             self.optimizer.step()
 
         self.scheduler.step()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         self.global_step += 1
 
     @torch.no_grad()
@@ -644,21 +638,12 @@ class Trainer:
             input_ids = batch["input_ids"].to(self.device, non_blocking=True)
             labels = batch["labels"].to(self.device, non_blocking=True)
 
-            if self.autocast_dtype is not None:
-                with torch.autocast(
-                    device_type=self.device.type, dtype=self.autocast_dtype
-                ):
-                    logits, _ = self.model(input_ids)
-                    loss = nn.functional.cross_entropy(
-                        logits.view(-1, logits.size(-1)),
-                        labels.view(-1),
-                    )
-            else:
-                logits, _ = self.model(input_ids)
-                loss = nn.functional.cross_entropy(
-                    logits.view(-1, logits.size(-1)),
-                    labels.view(-1),
-                )
+            # Model already in target dtype, no autocast needed
+            logits, _ = self.model(input_ids)
+            loss = nn.functional.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+            )
 
             batch_tokens = labels.numel()
             total_loss += loss.item() * batch_tokens
@@ -699,10 +684,42 @@ class Trainer:
         self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
         logger.info(f"Loaded checkpoint from {path} (step {self.global_step})")
 
+    def _warmup_compile(self) -> None:
+        """Run warmup iterations to trigger torch.compile compilation."""
+        if not self.config.use_torch_compile:
+            return
+
+        logger.info("Running warmup iteration to trigger torch.compile...")
+        self.model.train()
+
+        # Get one batch for warmup
+        warmup_iter = iter(self.train_dataloader)
+        try:
+            batch = next(warmup_iter)
+        except StopIteration:
+            logger.warning("No data for warmup")
+            return
+
+        input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+        labels = batch["labels"].to(self.device, non_blocking=True)
+
+        # Forward pass triggers compilation
+        with torch.no_grad():
+            _ = self.model(input_ids)
+
+        # Sync to ensure compilation is complete
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+
+        logger.info("Warmup complete, model compiled!")
+
     def train(self) -> None:
         """Main training loop."""
+        # Warmup to trigger compilation before timing
+        self._warmup_compile()
+
         self.model.train()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
         accumulation_step = 0
         running_loss_tensor = None  # Keep as tensor to avoid sync
