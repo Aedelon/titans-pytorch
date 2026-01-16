@@ -659,7 +659,7 @@ uv run python scripts/inference_mlx.py \
 | MAL | 96.91 |
 | LMM | 92.68 |
 
-### Inference Speed (Apple M3 Max)
+### Inference Speed (Apple M4 Pro)
 
 Configuration: batch=4, seq_len=256, dim=256, 4 layers
 
