@@ -49,6 +49,145 @@ if HAS_TRITON:
     # =============================================================================
 
     @triton.jit
+    def fused_add_rms_norm_kernel(
+        # Pointers
+        x_ptr,
+        residual_ptr,
+        weight_ptr,
+        output_ptr,
+        residual_out_ptr,  # Store x + residual for skip connection
+        # Sizes
+        n_rows,
+        n_cols,
+        eps,
+        # Block size
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused residual add + RMS normalization kernel.
+
+        Computes:
+            hidden = x + residual
+            output = hidden / sqrt(mean(hidden^2) + eps) * weight
+
+        Returns both hidden (for residual) and normalized output.
+        """
+        row_idx = tl.program_id(0)
+        if row_idx >= n_rows:
+            return
+
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+
+        # Load x and residual
+        x_ptrs = x_ptr + row_idx * n_cols + col_offsets
+        res_ptrs = residual_ptr + row_idx * n_cols + col_offsets
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+        res = tl.load(res_ptrs, mask=mask, other=0.0)
+
+        # Add residual
+        hidden = x + res
+
+        # Store hidden for skip connection
+        hidden_out_ptrs = residual_out_ptr + row_idx * n_cols + col_offsets
+        tl.store(hidden_out_ptrs, hidden, mask=mask)
+
+        # Compute RMS norm
+        hidden_sq = hidden * hidden
+        mean_sq = tl.sum(hidden_sq, axis=0) / n_cols
+        rms = tl.sqrt(mean_sq + eps)
+        hidden_norm = hidden / rms
+
+        # Apply weight
+        w = tl.load(weight_ptr + col_offsets, mask=mask, other=1.0)
+        output = hidden_norm * w
+
+        # Store normalized output
+        output_ptrs = output_ptr + row_idx * n_cols + col_offsets
+        tl.store(output_ptrs, output, mask=mask)
+
+    @triton.jit
+    def rms_norm_kernel(
+        # Pointers
+        x_ptr,
+        weight_ptr,
+        output_ptr,
+        # Sizes
+        n_rows,
+        n_cols,
+        eps,
+        # Block size
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused RMS normalization kernel.
+
+        Computes: output = x / sqrt(mean(x^2) + eps) * weight
+        More efficient than separate operations.
+        """
+        # Get row index
+        row_idx = tl.program_id(0)
+        if row_idx >= n_rows:
+            return
+
+        # Compute offsets for this row
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        mask = col_offsets < n_cols
+
+        # Load row
+        x_ptrs = x_ptr + row_idx * n_cols + col_offsets
+        x = tl.load(x_ptrs, mask=mask, other=0.0)
+
+        # Compute RMS
+        x_sq = x * x
+        mean_sq = tl.sum(x_sq, axis=0) / n_cols
+        rms = tl.sqrt(mean_sq + eps)
+
+        # Normalize
+        x_norm = x / rms
+
+        # Load weight and apply
+        w = tl.load(weight_ptr + col_offsets, mask=mask, other=1.0)
+        output = x_norm * w
+
+        # Store
+        output_ptrs = output_ptr + row_idx * n_cols + col_offsets
+        tl.store(output_ptrs, output, mask=mask)
+
+    @triton.jit
+    def fused_silu_mul_kernel(
+        # Pointers
+        gate_ptr,
+        up_ptr,
+        output_ptr,
+        # Size
+        n_elements,
+        # Block size
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused SiLU(gate) * up kernel."""
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+
+        # Load
+        gate = tl.load(gate_ptr + offsets, mask=mask, other=0.0)
+        up = tl.load(up_ptr + offsets, mask=mask, other=0.0)
+
+        # SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+        # Cast to fp32 for exp() which doesn't support bf16
+        gate_f32 = gate.to(tl.float32)
+        neg_gate = -gate_f32
+        exp_neg = tl.exp(neg_gate)
+        sigmoid_gate = 1.0 / (1.0 + exp_neg)
+        silu_gate = gate_f32 * sigmoid_gate
+
+        # Multiply (keep in fp32 for accuracy, will be cast on store)
+        up_f32 = up.to(tl.float32)
+        output = silu_gate * up_f32
+
+        # Store (auto-casts back to original dtype)
+        tl.store(output_ptr + offsets, output, mask=mask)
+
+    @triton.jit
     def memory_update_kernel(
         # Pointers
         weights_ptr,
@@ -191,13 +330,122 @@ if HAS_TRITON:
     # Python Wrappers
     # =============================================================================
 
+    def triton_fused_add_rms_norm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused residual add + RMS normalization.
+
+        Args:
+            x: Input tensor (batch, seq, dim)
+            residual: Residual tensor (same shape as x)
+            weight: RMSNorm weight (dim,)
+            eps: Epsilon for numerical stability
+
+        Returns:
+            Tuple of (hidden, normalized) where:
+                hidden = x + residual (for next residual)
+                normalized = rmsnorm(hidden, weight)
+        """
+        original_shape = x.shape
+        x = x.contiguous()
+        residual = residual.contiguous()
+
+        # Reshape to 2D if needed
+        if x.dim() == 3:
+            x = x.view(-1, x.size(-1))
+            residual = residual.view(-1, residual.size(-1))
+
+        n_rows, n_cols = x.shape
+        output = torch.empty_like(x)
+        hidden = torch.empty_like(x)
+
+        BLOCK_SIZE = triton.next_power_of_2(n_cols)
+
+        fused_add_rms_norm_kernel[(n_rows,)](
+            x, residual, weight, output, hidden,
+            n_rows, n_cols, eps,
+            BLOCK_SIZE,
+        )
+
+        return hidden.view(original_shape), output.view(original_shape)
+
+    def triton_rms_norm(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """RMS normalization using Triton kernel.
+
+        Args:
+            x: Input tensor (batch, seq, dim) or (batch*seq, dim)
+            weight: Weight tensor (dim,)
+            eps: Epsilon for numerical stability
+
+        Returns:
+            Normalized tensor same shape as input
+        """
+        original_shape = x.shape
+        x = x.contiguous()
+
+        # Reshape to 2D if needed
+        if x.dim() == 3:
+            x = x.view(-1, x.size(-1))
+
+        n_rows, n_cols = x.shape
+        output = torch.empty_like(x)
+
+        # Block size must be >= n_cols for reduction
+        BLOCK_SIZE = triton.next_power_of_2(n_cols)
+
+        # Launch kernel
+        rms_norm_kernel[(n_rows,)](
+            x, weight, output,
+            n_rows, n_cols, eps,
+            BLOCK_SIZE,
+        )
+
+        return output.view(original_shape)
+
+    def triton_fused_silu_mul(
+        gate: torch.Tensor,
+        up: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fused SiLU(gate) * up using Triton kernel.
+
+        Args:
+            gate: Gate tensor
+            up: Up tensor (same shape as gate)
+
+        Returns:
+            SiLU(gate) * up
+        """
+        gate = gate.contiguous()
+        up = up.contiguous()
+
+        n_elements = gate.numel()
+        output = torch.empty_like(gate)
+
+        BLOCK_SIZE = 1024
+        grid = (triton.cdiv(n_elements, BLOCK_SIZE),)
+
+        fused_silu_mul_kernel[grid](
+            gate, up, output,
+            n_elements,
+            BLOCK_SIZE,
+        )
+
+        return output
+
     def triton_memory_update(
         weights: list[torch.Tensor],
         momentum: list[torch.Tensor],
         gradients: list[torch.Tensor],
-        alpha: float,
-        eta: float,
-        theta: float,
+        alpha: torch.Tensor | float,
+        eta: torch.Tensor | float,
+        theta: torch.Tensor | float,
     ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """Update memory weights using Triton kernel.
 
@@ -205,9 +453,9 @@ if HAS_TRITON:
             weights: List of weight tensors
             momentum: List of momentum tensors
             gradients: List of gradient tensors
-            alpha: Decay factor
-            eta: Momentum coefficient
-            theta: Learning rate
+            alpha: Decay factor (tensor or float)
+            eta: Momentum coefficient (tensor or float)
+            theta: Learning rate (tensor or float)
 
         Returns:
             Tuple of (new_weights, new_momentum)
@@ -216,6 +464,15 @@ if HAS_TRITON:
         new_momentum = []
 
         BLOCK_SIZE = 1024
+
+        # Convert tensors to floats - use mean if batched, extract scalar if 0-dim
+        # This sync happens once per forward pass, not per element
+        if isinstance(alpha, torch.Tensor):
+            alpha = alpha.flatten()[0].item() if alpha.numel() > 0 else 0.01
+        if isinstance(eta, torch.Tensor):
+            eta = eta.flatten()[0].item() if eta.numel() > 0 else 0.9
+        if isinstance(theta, torch.Tensor):
+            theta = theta.flatten()[0].item() if theta.numel() > 0 else 0.1
 
         for w, m, g in zip(weights, momentum, gradients, strict=True):
             # Ensure contiguous

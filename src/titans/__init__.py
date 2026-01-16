@@ -36,6 +36,28 @@ from titans.flash_attention import (
 )
 from titans.triton_kernels import is_triton_available
 
+# GPU optimization modules
+from titans.cuda_optimizations import (
+    compile_model,
+    compile_function,
+    CUDAPrefetcher,
+    benchmark_model,
+    get_optimal_batch_size,
+)
+from titans.optimized_training import (
+    OptimizedTrainer,
+    OptimizedTrainingConfig,
+    enable_gradient_checkpointing,
+    memory_efficient_attention,
+)
+from titans.optimized_inference import (
+    OptimizedGenerator,
+    StaticKVCache,
+    KVCacheConfig,
+    ContinuousBatcher,
+    benchmark_generation,
+)
+
 # Hub must be imported after models to avoid circular imports
 from titans.hub import load_from_hub, push_to_hub
 
@@ -69,4 +91,21 @@ __all__ = [
     "TitansMAG",
     "TitansMAL",
     "TitansLMM",
+    # GPU Optimizations
+    "compile_model",
+    "compile_function",
+    "CUDAPrefetcher",
+    "benchmark_model",
+    "get_optimal_batch_size",
+    # Optimized Training
+    "OptimizedTrainer",
+    "OptimizedTrainingConfig",
+    "enable_gradient_checkpointing",
+    "memory_efficient_attention",
+    # Optimized Inference
+    "OptimizedGenerator",
+    "StaticKVCache",
+    "KVCacheConfig",
+    "ContinuousBatcher",
+    "benchmark_generation",
 ]

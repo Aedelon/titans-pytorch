@@ -232,20 +232,21 @@ class SlidingWindowAttention(nn.Module):
             q, _ = self.rope(q, q, seq_offset=prefix_len + seq_offset)
             k, _ = self.rope(k, k, seq_offset=seq_offset)
 
-        # Compute attention scores
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        # Create attention mask
+        # Create attention mask for sliding window
         # For queries in x, we create a mask for attending to full_x
         mask = self._create_extended_mask(seq_len, full_len, prefix_len, x.device)
-        attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
+        # Convert to additive mask for SDPA (0 = attend, -inf = mask)
+        attn_mask = torch.zeros_like(mask, dtype=q.dtype)
+        attn_mask.masked_fill_(~mask, float("-inf"))
 
-        # Softmax and dropout
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        # Apply attention
-        output = torch.matmul(attn_weights, v)
+        # Use PyTorch SDPA for efficiency
+        output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            is_causal=False,  # We provide explicit mask
+            scale=self.scale,
+        )
 
         # Reshape back
         output = rearrange(output, "b h s d -> b s (h d)")
@@ -385,19 +386,15 @@ class SegmentedAttention(nn.Module):
         if self.rope is not None:
             q, k = self.rope(q, k)
 
-        # Compute attention scores
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-
-        # Create causal mask
-        mask = self._create_causal_mask(full_len, x.device)
-        attn_scores = attn_scores.masked_fill(~mask, float("-inf"))
-
-        # Softmax and dropout
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-
-        # Apply attention
-        output = torch.matmul(attn_weights, v)
+        # Use PyTorch SDPA for efficiency (Flash Attention when available)
+        # SDPA handles causal masking internally with is_causal=True
+        output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            is_causal=True,
+            scale=self.scale,
+        )
 
         # Reshape back
         output = rearrange(output, "b h s d -> b s (h d)")

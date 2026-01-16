@@ -49,6 +49,17 @@ from tqdm import tqdm
 
 from titans import TitansConfig, TitansLMM, TitansMAC, TitansMAG, TitansMAL
 
+# CUDA optimizations
+try:
+    from titans.cuda_optimizations import (
+        CUDAPrefetcher,
+        configure_memory_pool,
+        empty_cache_if_needed,
+    )
+    HAS_CUDA_OPTS = True
+except ImportError:
+    HAS_CUDA_OPTS = False
+
 # Optional imports
 try:
     from transformers import AutoTokenizer, PreTrainedTokenizerBase
@@ -103,6 +114,7 @@ class TrainingConfig:
     dataset: str | None = None  # HuggingFace dataset name
     dataset_subset: str | None = None  # Dataset subset/config
     data_path: str | None = None  # Local text file
+    local_dataset: str | None = None  # Local HuggingFace dataset (from save_to_disk)
     tokenizer: str = "gpt2"  # HuggingFace tokenizer
     seq_len: int = 4096  # Paper uses 4K
 
@@ -135,6 +147,11 @@ class TrainingConfig:
     seed: int = 42
     num_workers: int = 4
     synthetic_samples: int = 10000  # For demo mode
+
+    # CUDA optimizations
+    use_torch_compile: bool = False  # Enable torch.compile for faster training
+    compile_mode: str = "reduce-overhead"  # default, reduce-overhead, max-autotune
+    gradient_checkpointing: bool = False  # Enable gradient checkpointing for memory efficiency
 
 
 # =============================================================================
@@ -224,8 +241,97 @@ class CharLevelDataset(Dataset):
         return {"input_ids": x, "labels": y}
 
 
+class LocalHFDataset(Dataset):
+    """Dataset from a local HuggingFace dataset saved with save_to_disk().
+
+    Supports two formats:
+    1. Pre-tokenized: dataset has 'input_ids' field (from pretokenize.py)
+    2. Raw text: dataset has 'text' field (will tokenize on load)
+    """
+
+    def __init__(
+        self,
+        path: str,
+        tokenizer: PreTrainedTokenizerBase | None,
+        seq_len: int,
+        seed: int = 42,
+    ) -> None:
+        from datasets import load_from_disk
+
+        self.seq_len = seq_len
+
+        # Load dataset from disk
+        logger.info(f"Loading local dataset from {path}")
+        self.dataset = load_from_disk(path)
+
+        # Shuffle
+        self.dataset = self.dataset.shuffle(seed=seed)
+        logger.info(f"Loaded {len(self.dataset)} samples")
+
+        # Check if already pre-tokenized
+        first_example = self.dataset[0]
+        self.is_pretokenized = "input_ids" in first_example and isinstance(
+            first_example["input_ids"], (list, tuple)
+        )
+
+        if self.is_pretokenized:
+            # Already tokenized - use directly (fast path)
+            logger.info("Dataset is pre-tokenized, using directly (fast path)")
+            self.tokens_list = None  # Use self.dataset directly
+        else:
+            # Need to tokenize (slow path)
+            if tokenizer is None:
+                raise ValueError("Tokenizer required for non-pretokenized datasets")
+
+            logger.info("Dataset is raw text, tokenizing...")
+            self.tokens_list = []
+            buffer = []
+
+            for i, example in enumerate(self.dataset):
+                text = example.get("text") or example.get("content") or str(example)
+                tokens = tokenizer.encode(text, add_special_tokens=False)
+                buffer.extend(tokens)
+
+                # Create samples from buffer
+                while len(buffer) >= seq_len + 1:
+                    self.tokens_list.append(
+                        torch.tensor(buffer[: seq_len + 1], dtype=torch.long)
+                    )
+                    buffer = buffer[seq_len:]  # Non-overlapping for efficiency
+
+                if (i + 1) % 50000 == 0:
+                    logger.info(
+                        f"  Processed {i+1} samples, created {len(self.tokens_list)} sequences"
+                    )
+
+            logger.info(f"Created {len(self.tokens_list)} training sequences")
+
+    def __len__(self) -> int:
+        if self.is_pretokenized:
+            return len(self.dataset)
+        return len(self.tokens_list)
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        if self.is_pretokenized:
+            # Pre-tokenized: input_ids already contains seq_len+1 tokens
+            tokens = self.dataset[idx]["input_ids"]
+            if not isinstance(tokens, torch.Tensor):
+                tokens = torch.tensor(tokens, dtype=torch.long)
+            return {
+                "input_ids": tokens[:-1],
+                "labels": tokens[1:],
+            }
+        else:
+            # Tokenized on load
+            tokens = self.tokens_list[idx]
+            return {
+                "input_ids": tokens[:-1],
+                "labels": tokens[1:],
+            }
+
+
 class StreamingDataset(IterableDataset):
-    """Streaming dataset from HuggingFace datasets."""
+    """Streaming dataset from HuggingFace datasets with multi-worker support."""
 
     def __init__(
         self,
@@ -235,6 +341,7 @@ class StreamingDataset(IterableDataset):
         subset: str | None = None,
         split: str = "train",
         seed: int = 42,
+        num_workers: int = 0,
     ) -> None:
         self.dataset_name = dataset_name
         self.tokenizer = tokenizer
@@ -242,20 +349,32 @@ class StreamingDataset(IterableDataset):
         self.subset = subset
         self.split = split
         self.seed = seed
+        self.num_workers = num_workers
 
     def __iter__(self):
+        # Get worker info for multi-process data loading
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        num_workers = worker_info.num_workers if worker_info else 1
+
         # Load dataset in streaming mode
         ds = load_dataset(
             self.dataset_name,
             self.subset,
             split=self.split,
             streaming=True,
-            trust_remote_code=True,
         )
-        ds = ds.shuffle(seed=self.seed, buffer_size=10000)
+        ds = ds.shuffle(seed=self.seed + worker_id, buffer_size=10000)
 
         buffer = []
+        sample_idx = 0
         for example in ds:
+            # Shard across workers: each worker processes every Nth example
+            if sample_idx % num_workers != worker_id:
+                sample_idx += 1
+                continue
+            sample_idx += 1
+
             # Get text from example (try common field names)
             text = example.get("text") or example.get("content") or str(example)
 
@@ -358,6 +477,32 @@ class Trainer:
         self.device = device
         self.model = self.model.to(self.device)
 
+        # Apply torch.compile for faster training (PyTorch 2.0+)
+        if config.use_torch_compile and hasattr(torch, "compile") and self.device.type == "cuda":
+            logger.info(f"Applying torch.compile (mode={config.compile_mode})")
+            try:
+                self.model = torch.compile(
+                    self.model,
+                    mode=config.compile_mode,
+                    fullgraph=False,
+                    dynamic=True,
+                )
+            except Exception as e:
+                logger.warning(f"torch.compile failed: {e}")
+
+        # Configure CUDA memory pool
+        if HAS_CUDA_OPTS and self.device.type == "cuda":
+            configure_memory_pool()
+
+        # Note: Gradient checkpointing is incompatible with Titans memory module
+        # which computes gradients during forward pass. Skip for now.
+        if config.gradient_checkpointing:
+            logger.warning(
+                "Gradient checkpointing is not compatible with Titans memory module. "
+                "The memory module computes gradients during forward pass which conflicts "
+                "with checkpointing. Ignoring --gradient-checkpointing flag."
+            )
+
         # Optimizer (AdamW as in paper)
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
@@ -411,8 +556,9 @@ class Trainer:
         self, batch: dict[str, torch.Tensor]
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Single training step with mixed precision."""
-        input_ids = batch["input_ids"].to(self.device)
-        labels = batch["labels"].to(self.device)
+        # Use non_blocking=True to overlap CPU->GPU transfer with computation
+        input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+        labels = batch["labels"].to(self.device, non_blocking=True)
 
         # Forward pass with autocast
         if self.autocast_dtype is not None:
@@ -440,7 +586,29 @@ class Trainer:
         else:
             scaled_loss.backward()
 
-        return loss, {"loss": loss.item(), "ppl": math.exp(loss.item())}
+        # Return loss tensor directly - avoid .item() sync on every step
+        # Only convert to scalar when actually logging (every log_every steps)
+        return loss, {"loss_tensor": loss.detach()}
+
+    def _enable_gradient_checkpointing(self) -> None:
+        """Enable gradient checkpointing for all transformer blocks."""
+        from torch.utils.checkpoint import checkpoint
+
+        # Find all blocks with forward method
+        for name, module in self.model.named_modules():
+            if hasattr(module, "blocks") and isinstance(module.blocks, nn.ModuleList):
+                for i, block in enumerate(module.blocks):
+                    original_forward = block.forward
+
+                    def make_checkpointed_forward(orig_fwd):
+                        def checkpointed_forward(*args, **kwargs):
+                            # Use use_reentrant=False for better compatibility
+                            def forward_fn(*fwd_args):
+                                return orig_fwd(*fwd_args, **kwargs)
+                            return checkpoint(forward_fn, *args, use_reentrant=False)
+                        return checkpointed_forward
+
+                    block.forward = make_checkpointed_forward(original_forward)
 
     def optimizer_step(self) -> None:
         """Optimizer step with gradient clipping and scaling."""
@@ -473,8 +641,8 @@ class Trainer:
         total_tokens = 0
 
         for batch in tqdm(self.val_dataloader, desc="Evaluating", leave=False):
-            input_ids = batch["input_ids"].to(self.device)
-            labels = batch["labels"].to(self.device)
+            input_ids = batch["input_ids"].to(self.device, non_blocking=True)
+            labels = batch["labels"].to(self.device, non_blocking=True)
 
             if self.autocast_dtype is not None:
                 with torch.autocast(
@@ -537,22 +705,39 @@ class Trainer:
         self.optimizer.zero_grad()
 
         accumulation_step = 0
-        running_loss = 0.0
+        running_loss_tensor = None  # Keep as tensor to avoid sync
         running_count = 0
 
         start_time = time.time()
         pbar = tqdm(total=self.total_steps, initial=self.global_step, desc="Training")
 
+        # Use CUDA prefetching for better GPU utilization
+        use_prefetch = (
+            HAS_CUDA_OPTS
+            and self.device.type == "cuda"
+            and not isinstance(self.train_dataloader.dataset, IterableDataset)
+        )
+
         while self.global_step < self.total_steps:
             self.epoch += 1
 
-            for batch in self.train_dataloader:
+            # Setup data iterator with optional prefetching
+            if use_prefetch:
+                data_iter = CUDAPrefetcher(self.train_dataloader, self.device)
+            else:
+                data_iter = self.train_dataloader
+
+            for batch in data_iter:
                 if self.global_step >= self.total_steps:
                     break
 
                 # Training step
                 loss, metrics = self.train_step(batch)
-                running_loss += metrics["loss"]
+                # Accumulate loss tensor without sync - sync only at logging time
+                if running_count == 0:
+                    running_loss_tensor = metrics["loss_tensor"]
+                else:
+                    running_loss_tensor = running_loss_tensor + metrics["loss_tensor"]
                 running_count += 1
                 accumulation_step += 1
 
@@ -561,14 +746,15 @@ class Trainer:
                     self.optimizer_step()
                     accumulation_step = 0
 
-                    # Logging
+                    # Logging - only sync here (every log_every steps)
                     if self.global_step % self.config.log_every == 0:
-                        avg_loss = running_loss / running_count
+                        # Single sync point: convert accumulated tensor to scalar
+                        avg_loss = (running_loss_tensor / running_count).item()
                         current_lr = self.scheduler.get_last_lr()[0]
 
                         log_dict = {
                             "train/loss": avg_loss,
-                            "train/ppl": math.exp(avg_loss),
+                            "train/ppl": math.exp(min(avg_loss, 20)),  # Clamp to avoid overflow
                             "train/lr": current_lr,
                             "train/step": self.global_step,
                         }
@@ -576,7 +762,7 @@ class Trainer:
                         pbar.set_postfix(
                             {
                                 "loss": f"{avg_loss:.4f}",
-                                "ppl": f"{math.exp(avg_loss):.2f}",
+                                "ppl": f"{math.exp(min(avg_loss, 20)):.2f}",
                                 "lr": f"{current_lr:.2e}",
                             }
                         )
@@ -584,7 +770,7 @@ class Trainer:
                         if self.config.wandb and HAS_WANDB:
                             wandb.log(log_dict, step=self.global_step)
 
-                        running_loss = 0.0
+                        running_loss_tensor = None
                         running_count = 0
 
                     # Evaluation
@@ -674,6 +860,12 @@ def main() -> None:
     )
     parser.add_argument("--data", type=str, default=None, help="Local text file path")
     parser.add_argument(
+        "--local-dataset",
+        type=str,
+        default=None,
+        help="Local HuggingFace dataset path (from save_to_disk)",
+    )
+    parser.add_argument(
         "--tokenizer",
         type=str,
         default="gpt2",
@@ -736,6 +928,23 @@ def main() -> None:
         "--synthetic-samples", type=int, default=10000, help="Synthetic samples (demo)"
     )
 
+    # CUDA optimizations
+    parser.add_argument(
+        "--torch-compile", action="store_true", help="Enable torch.compile for faster training"
+    )
+    parser.add_argument(
+        "--compile-mode",
+        type=str,
+        default="reduce-overhead",
+        choices=["default", "reduce-overhead", "max-autotune"],
+        help="torch.compile mode",
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help="Enable gradient checkpointing to reduce memory usage",
+    )
+
     args = parser.parse_args()
 
     # Set random seed
@@ -753,6 +962,7 @@ def main() -> None:
         dataset=args.dataset,
         dataset_subset=args.dataset_subset,
         data_path=args.data,
+        local_dataset=args.local_dataset,
         tokenizer=args.tokenizer,
         seq_len=args.seq_len,
         epochs=args.epochs,
@@ -775,6 +985,9 @@ def main() -> None:
         seed=args.seed,
         num_workers=args.num_workers,
         synthetic_samples=args.synthetic_samples,
+        use_torch_compile=args.torch_compile,
+        compile_mode=args.compile_mode,
+        gradient_checkpointing=args.gradient_checkpointing,
     )
 
     # Check dependencies
@@ -790,7 +1003,7 @@ def main() -> None:
 
     # Load tokenizer
     tokenizer = None
-    if HAS_TRANSFORMERS and (config.dataset or config.data_path):
+    if HAS_TRANSFORMERS and (config.dataset or config.data_path or config.local_dataset):
         logger.info(f"Loading tokenizer: {config.tokenizer}")
         tokenizer = AutoTokenizer.from_pretrained(config.tokenizer)
         if tokenizer.pad_token is None:
@@ -822,7 +1035,31 @@ def main() -> None:
     train_dataset: Dataset | IterableDataset
     val_dataset: Dataset | None = None
 
-    if config.dataset:
+    if config.local_dataset:
+        # Local HuggingFace dataset (from save_to_disk)
+        logger.info(f"Using local HuggingFace dataset: {config.local_dataset}")
+        if tokenizer is None:
+            raise ValueError("Tokenizer required for local datasets")
+
+        full_dataset = LocalHFDataset(
+            config.local_dataset,
+            tokenizer,
+            config.seq_len,
+            seed=config.seed,
+        )
+
+        # Split into train/val
+        train_size = int(0.95 * len(full_dataset))
+        val_size = len(full_dataset) - train_size
+        if val_size > 0:
+            train_dataset, val_dataset = torch.utils.data.random_split(
+                full_dataset, [train_size, val_size]
+            )
+        else:
+            train_dataset = full_dataset
+        logger.info(f"Train samples: {len(train_dataset)}, Val samples: {val_size}")
+
+    elif config.dataset:
         # HuggingFace streaming dataset
         logger.info(f"Using HuggingFace dataset: {config.dataset}")
         if tokenizer is None:
@@ -869,25 +1106,48 @@ def main() -> None:
             config.seed + 1,
         )
 
-    # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        shuffle=not isinstance(train_dataset, IterableDataset),
-        num_workers=config.num_workers
-        if not isinstance(train_dataset, IterableDataset)
-        else 0,
-        pin_memory=True,
+    # Create dataloaders with optimized settings
+    is_streaming = isinstance(train_dataset, IterableDataset)
+    use_workers = config.num_workers > 0
+
+    # DataLoader optimization settings
+    loader_kwargs = {
+        "batch_size": config.batch_size,
+        "pin_memory": True,  # Fast CPU->GPU transfer
+        "num_workers": config.num_workers,
+        "drop_last": True,  # Avoid incomplete batches for consistent GPU perf
+    }
+
+    # Add prefetch and persistent workers only if using workers
+    if use_workers:
+        loader_kwargs["prefetch_factor"] = 4  # Prefetch 4 batches per worker
+        loader_kwargs["persistent_workers"] = True  # Keep workers alive between epochs
+
+    if is_streaming:
+        loader_kwargs["shuffle"] = False  # Streaming handles its own shuffling
+    else:
+        loader_kwargs["shuffle"] = True
+
+    logger.info(
+        f"DataLoader: num_workers={config.num_workers}, pin_memory=True, "
+        f"prefetch_factor={4 if use_workers else 'N/A'}, "
+        f"persistent_workers={use_workers}, drop_last=True"
     )
+
+    train_loader = DataLoader(train_dataset, **loader_kwargs)
 
     val_loader = None
     if val_dataset is not None:
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-        )
+        val_loader_kwargs = {
+            "batch_size": config.batch_size,
+            "shuffle": False,
+            "pin_memory": True,
+            "num_workers": config.num_workers,
+        }
+        if use_workers:
+            val_loader_kwargs["prefetch_factor"] = 2
+            val_loader_kwargs["persistent_workers"] = True
+        val_loader = DataLoader(val_dataset, **val_loader_kwargs)
 
     # Log effective batch size
     effective_batch_size = (

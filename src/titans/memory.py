@@ -31,6 +31,23 @@ from einops import rearrange
 
 from titans.config import TitansConfig
 
+# Import optimizations
+try:
+    from titans.cuda_optimizations import (
+        batched_memory_update,
+        compute_memory_gradients_efficient,
+    )
+    HAS_CUDA_OPTIMIZATIONS = True
+except ImportError:
+    HAS_CUDA_OPTIMIZATIONS = False
+
+# Check for Triton availability
+try:
+    from titans.triton_kernels import triton_memory_update, is_triton_available
+    HAS_TRITON = is_triton_available()
+except ImportError:
+    HAS_TRITON = False
+
 
 def get_activation(name: str) -> nn.Module:
     """Get activation function by name."""
@@ -277,6 +294,11 @@ class NeuralLongTermMemory(nn.Module):
         This computes the gradient of the associative memory loss
         with respect to the memory weights.
 
+        Uses optimized gradient computation when available:
+        - Analytical gradients for single-layer memory
+        - Triton kernels for fused operations
+        - Fallback to autograd for complex cases
+
         Args:
             keys: Key vectors (batch, seq, dim)
             values: Value vectors (batch, seq, dim)
@@ -284,6 +306,19 @@ class NeuralLongTermMemory(nn.Module):
         Returns:
             List of gradient tensors for each memory layer
         """
+        # Try optimized gradient computation first
+        if HAS_CUDA_OPTIMIZATIONS and keys.is_cuda:
+            try:
+                weights = [layer.weight.data for layer in self.memory.layers]
+                return compute_memory_gradients_efficient(
+                    keys.detach(),
+                    values.detach(),
+                    weights,
+                    activation=self.config.activation,
+                )
+            except Exception:
+                pass  # Fall back to standard method
+
         # Use torch.enable_grad() to compute gradients even in inference mode
         # This is essential because Titans learns at test time
         with torch.enable_grad():
@@ -400,17 +435,21 @@ class NeuralLongTermMemory(nn.Module):
         # Compute gradients of associative memory loss
         grads = self._compute_gradients(k, v)
 
-        # Update momentum: S_t = eta * S_{t-1} - theta * grad
-        new_momentum = []
-        for m, g in zip(state.momentum, grads, strict=True):
-            s = eta * m - theta * g
-            new_momentum.append(s)
-
-        # Update weights: M_t = (1 - alpha) * M_{t-1} + S_t
-        new_weights = []
-        for w, s in zip(state.weights, new_momentum, strict=True):
-            w_new = (1 - alpha) * w + s
-            new_weights.append(w_new)
+        # Use optimized batched memory update when available
+        # Note: Triton path disabled - .item() calls cause CPU-GPU sync slowdown
+        if HAS_CUDA_OPTIMIZATIONS and k.is_cuda:
+            try:
+                new_weights, new_momentum = batched_memory_update(
+                    state.weights, state.momentum, grads, alpha, eta, theta
+                )
+            except Exception:
+                new_weights, new_momentum = self._standard_memory_update(
+                    state.weights, state.momentum, grads, alpha, eta, theta
+                )
+        else:
+            new_weights, new_momentum = self._standard_memory_update(
+                state.weights, state.momentum, grads, alpha, eta, theta
+            )
 
         # Output projection
         output = self.proj_out(retrieved)
@@ -421,6 +460,42 @@ class NeuralLongTermMemory(nn.Module):
         if return_state:
             return output, new_state.detach()
         return output, None
+
+    def _standard_memory_update(
+        self,
+        weights: list[torch.Tensor],
+        momentum: list[torch.Tensor],
+        grads: list[torch.Tensor],
+        alpha: torch.Tensor | float,
+        eta: torch.Tensor | float,
+        theta: torch.Tensor | float,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """Standard memory update using PyTorch operations.
+
+        Args:
+            weights: Current weight tensors
+            momentum: Current momentum tensors
+            grads: Gradient tensors
+            alpha: Decay factor
+            eta: Momentum coefficient
+            theta: Learning rate
+
+        Returns:
+            Tuple of (new_weights, new_momentum)
+        """
+        # Update momentum: S_t = eta * S_{t-1} - theta * grad
+        new_momentum = []
+        for m, g in zip(momentum, grads, strict=True):
+            s = eta * m - theta * g
+            new_momentum.append(s)
+
+        # Update weights: M_t = (1 - alpha) * M_{t-1} + S_t
+        new_weights = []
+        for w, s in zip(weights, new_momentum, strict=True):
+            w_new = (1 - alpha) * w + s
+            new_weights.append(w_new)
+
+        return new_weights, new_momentum
 
     def retrieve(
         self,

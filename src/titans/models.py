@@ -25,7 +25,10 @@ from titans.persistent import PersistentMemory
 
 
 class FeedForward(nn.Module):
-    """Feed-forward network with gating (following recent architectures)."""
+    """Feed-forward network with gating (following recent architectures).
+
+    Uses Triton fused kernel when available for better performance.
+    """
 
     def __init__(self, config: TitansConfig) -> None:
         super().__init__()
@@ -36,28 +39,101 @@ class FeedForward(nn.Module):
         self.up_proj = nn.Linear(config.dim, config.ffn_dim, bias=False)
         self.down_proj = nn.Linear(config.ffn_dim, config.dim, bias=False)
         self.dropout = nn.Dropout(config.dropout)
+        self._use_triton: bool | None = None
+
+    def _should_use_triton(self, x: torch.Tensor) -> bool:
+        """Check if we should use Triton kernel."""
+        if self._use_triton is None:
+            try:
+                from titans.triton_kernels import is_triton_available, triton_fused_silu_mul
+                self._use_triton = is_triton_available()
+                self._triton_silu_mul = triton_fused_silu_mul
+            except ImportError:
+                self._use_triton = False
+        return self._use_triton and x.is_cuda
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with SiLU gating."""
-        gate = F.silu(self.gate_proj(x))
+        gate = self.gate_proj(x)
         up = self.up_proj(x)
-        hidden = gate * up
+
+        # Fused SiLU + multiply
+        if self._should_use_triton(x):
+            try:
+                hidden = self._triton_silu_mul(gate, up)
+            except Exception:
+                hidden = F.silu(gate) * up
+        else:
+            hidden = F.silu(gate) * up
+
         hidden = self.dropout(hidden)
         return self.down_proj(hidden)
 
 
 class RMSNorm(nn.Module):
-    """Root Mean Square Layer Normalization."""
+    """Root Mean Square Layer Normalization.
+
+    Uses Triton kernel when available for better performance.
+    Supports fused residual add + norm for efficiency.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
+        self.dim = dim
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self._use_triton: bool | None = None  # Lazy init
+        self._triton_rms_norm = None
+        self._triton_fused_add_rms_norm = None
+
+    def _init_triton(self, x: torch.Tensor) -> bool:
+        """Initialize Triton kernels if available."""
+        if self._use_triton is None:
+            try:
+                from titans.triton_kernels import (
+                    is_triton_available,
+                    triton_rms_norm,
+                    triton_fused_add_rms_norm,
+                )
+                self._use_triton = is_triton_available() and x.is_cuda
+                self._triton_rms_norm = triton_rms_norm
+                self._triton_fused_add_rms_norm = triton_fused_add_rms_norm
+            except ImportError:
+                self._use_triton = False
+        return self._use_triton and x.is_cuda
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply RMS normalization."""
+        if self._init_triton(x) and x.size(-1) == self.dim:
+            try:
+                return self._triton_rms_norm(x, self.weight, self.eps)
+            except Exception:
+                pass  # Fallback to PyTorch
+        # PyTorch fallback
         rms = torch.sqrt(torch.mean(x**2, dim=-1, keepdim=True) + self.eps)
         return x / rms * self.weight
+
+    def forward_with_residual(
+        self, x: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fused residual add + RMS normalization.
+
+        Args:
+            x: Input tensor
+            residual: Residual tensor to add
+
+        Returns:
+            Tuple of (hidden, normalized) where hidden = x + residual
+        """
+        if self._init_triton(x) and x.size(-1) == self.dim:
+            try:
+                return self._triton_fused_add_rms_norm(x, residual, self.weight, self.eps)
+            except Exception:
+                pass
+        # PyTorch fallback
+        hidden = x + residual
+        rms = torch.sqrt(torch.mean(hidden**2, dim=-1, keepdim=True) + self.eps)
+        return hidden, hidden / rms * self.weight
 
 
 # =============================================================================
