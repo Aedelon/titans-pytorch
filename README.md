@@ -347,11 +347,40 @@ mx.eval(output)
 
 ### PyTorch Pretraining
 
+#### Pre-tokenization (Recommended for Large Datasets)
+
+Pre-tokenize your dataset once to eliminate tokenization bottleneck during training:
+
+```bash
+# Pre-tokenize FineWeb-Edu
+uv run python scripts/pretokenize.py \
+    --dataset HuggingFaceFW/fineweb-edu \
+    --subset sample-10BT \
+    --tokenizer NousResearch/Llama-2-7b-hf \
+    --output data/fineweb-tokenized \
+    --seq-len 4096 \
+    --num-proc 8
+
+# Then train with pre-tokenized data (much faster)
+uv run python scripts/pretrain.py --model mac \
+    --local-dataset data/fineweb-tokenized \
+    --tokenizer NousResearch/Llama-2-7b-hf \
+    --dim 512 --num-layers 12
+```
+
+#### Training Commands
+
 ```bash
 # Demo with synthetic data (quick test)
 uv run python scripts/pretrain.py --model mac --dim 256 --epochs 10
 
-# Train with FineWeb-Edu (streaming)
+# Train with pre-tokenized local dataset (fastest)
+uv run python scripts/pretrain.py --model mac \
+    --local-dataset data/fineweb-tokenized \
+    --tokenizer NousResearch/Llama-2-7b-hf \
+    --dim 512 --num-layers 12
+
+# Train with streaming dataset (no pre-tokenization)
 uv run python scripts/pretrain.py --model mac \
     --dataset HuggingFaceFW/fineweb-edu \
     --tokenizer meta-llama/Llama-2-7b-hf \
@@ -359,8 +388,8 @@ uv run python scripts/pretrain.py --model mac \
 
 # Full training with paper hyperparameters (340M params)
 uv run python scripts/pretrain.py --model mac \
-    --dataset HuggingFaceFW/fineweb-edu \
-    --tokenizer meta-llama/Llama-2-7b-hf \
+    --local-dataset data/fineweb-tokenized \
+    --tokenizer NousResearch/Llama-2-7b-hf \
     --dim 1024 --num-layers 24 --num-heads 16 \
     --batch-size 8 --gradient-accumulation-steps 32 \
     --lr 4e-4 --weight-decay 0.1 \
@@ -384,14 +413,39 @@ uv run python scripts/pretrain.py --model mac \
 | `--dim` | `512` | Model dimension |
 | `--num-heads` | `8` | Attention heads |
 | `--num-layers` | `12` | Number of layers |
-| `--dataset` | - | HuggingFace dataset name |
+| `--local-dataset` | - | Pre-tokenized local dataset (Arrow format) |
+| `--dataset` | - | HuggingFace dataset name (streaming) |
 | `--tokenizer` | `gpt2` | HuggingFace tokenizer |
 | `--batch-size` | `4` | Per-device batch size |
 | `--gradient-accumulation-steps` | `32` | Gradient accumulation |
 | `--lr` | `4e-4` | Learning rate |
 | `--weight-decay` | `0.1` | Weight decay |
 | `--mixed-precision` | `bf16` | none, fp16, bf16 |
+| `--use-torch-compile` | `False` | Enable torch.compile (PyTorch 2.0+) |
 | `--wandb` | `False` | Enable W&B logging |
+
+#### CUDA Optimizations
+
+The training scripts include automatic CUDA optimizations:
+
+- **TF32 Precision**: Enabled by default on Ampere+ GPUs for faster matmul
+- **cuDNN Benchmark**: Auto-tunes convolution algorithms
+- **Fused AdamW**: Optimizer runs entirely on GPU
+- **BFloat16 Native**: Model initialized in bf16 (no autocast overhead)
+- **Non-blocking Transfers**: CPU→GPU transfers overlap with computation
+
+### Distributed Training (Multi-GPU)
+
+```bash
+# Multi-GPU with DDP (auto-detects GPUs)
+uv run accelerate launch scripts/pretrain_distributed.py \
+    --model mac --dim 512 \
+    --local-dataset data/fineweb-tokenized
+
+# Multi-GPU with custom config
+uv run accelerate launch --config_file configs/fsdp_config.yaml \
+    scripts/pretrain_distributed.py --model mac --dim 1024
+```
 
 ### MLX Pretraining
 
@@ -756,7 +810,7 @@ For exact reproducibility, use the same backend.
 ### Project Structure
 
 ```
-Google-Titans-replication/
+titans-pytorch/
 ├── src/
 │   ├── titans/                 # PyTorch implementation
 │   │   ├── __init__.py
@@ -778,12 +832,12 @@ Google-Titans-replication/
 │       └── metal_kernels.py    # Metal kernels
 │
 ├── scripts/
-│   ├── pretrain.py             # PyTorch training
+│   ├── pretrain.py             # PyTorch training (optimized)
+│   ├── pretrain_distributed.py # Multi-GPU training (Accelerate)
 │   ├── pretrain_mlx.py         # MLX training
+│   ├── pretokenize.py          # Dataset pre-tokenization
 │   ├── inference.py            # PyTorch inference
-│   ├── inference_mlx.py        # MLX inference
-│   ├── benchmark_mlx.py        # Benchmark suite
-│   └── benchmark_metal_kernels.py
+│   └── inference_mlx.py        # MLX inference
 │
 ├── tests/
 │   ├── test_memory.py
@@ -819,14 +873,13 @@ uv run ruff check src/ tests/ scripts/
 uv run ruff format src/ tests/ scripts/
 ```
 
-### Benchmarking
+### Profiling
 
 ```bash
-# Full benchmark (PyTorch + MLX)
-uv run python scripts/benchmark_mlx.py
-
-# Metal kernels benchmark
-uv run python scripts/benchmark_metal_kernels.py
+# Profile training to identify bottlenecks
+uv run python scripts/profile_training.py \
+    --model mac --dim 256 --num-layers 4 \
+    --batch-size 4 --num-steps 50
 ```
 
 ---
