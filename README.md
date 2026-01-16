@@ -412,20 +412,47 @@ uv run python scripts/pretrain.py --model mac \
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| **Model Architecture** |
 | `--model` | `mac` | Model variant: mac, mag, mal, lmm |
 | `--dim` | `512` | Model dimension |
 | `--num-heads` | `8` | Attention heads |
 | `--num-layers` | `12` | Number of layers |
-| `--local-dataset` | - | Pre-tokenized local dataset (Arrow format) |
+| `--vocab-size` | `32000` | Vocabulary size |
+| `--chunk-size` | `512` | Chunk size for MAC |
+| `--window-size` | `512` | Window size for MAG/MAL |
+| **Data** |
 | `--dataset` | - | HuggingFace dataset name (streaming) |
+| `--dataset-subset` | - | Dataset subset (e.g., sample-10BT) |
+| `--local-dataset` | - | Pre-tokenized local dataset (Arrow format) |
+| `--data` | - | Local text file path |
 | `--tokenizer` | `gpt2` | HuggingFace tokenizer |
+| `--seq-len` | `4096` | Sequence length |
+| **Training** |
+| `--epochs` | `1` | Number of epochs |
+| `--max-steps` | `-1` | Max steps (-1 = use epochs) |
 | `--batch-size` | `4` | Per-device batch size |
-| `--gradient-accumulation-steps` | `32` | Gradient accumulation |
+| `--gradient-accumulation-steps` | `32` | Gradient accumulation steps |
 | `--lr` | `4e-4` | Learning rate |
 | `--weight-decay` | `0.1` | Weight decay |
+| `--grad-clip` | `1.0` | Gradient clipping |
+| `--warmup-ratio` | `0.03` | Warmup ratio |
 | `--mixed-precision` | `bf16` | none, fp16, bf16 |
-| `--use-torch-compile` | `False` | Enable torch.compile (PyTorch 2.0+) |
+| **Optimization** |
+| `--torch-compile` | `False` | Enable torch.compile (PyTorch 2.0+) |
+| `--compile-mode` | `default` | default, reduce-overhead, max-autotune |
+| `--gradient-checkpointing` | `False` | Enable gradient checkpointing |
+| `--num-workers` | `4` | DataLoader workers |
+| **Checkpointing** |
+| `--checkpoint-dir` | `checkpoints/` | Checkpoint directory |
+| `--save-every` | `1000` | Save every N steps |
+| `--eval-every` | `500` | Eval every N steps |
+| `--resume` | - | Resume from checkpoint |
+| **Logging** |
+| `--log-every` | `10` | Log every N steps |
 | `--wandb` | `False` | Enable W&B logging |
+| `--wandb-project` | `titans` | W&B project name |
+| `--wandb-run-name` | - | W&B run name |
+| `--seed` | `42` | Random seed |
 
 #### CUDA Optimizations
 
@@ -483,17 +510,41 @@ uv run python scripts/pretrain_mlx.py --model mac \
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| **Model Architecture** |
 | `--model` | `mac` | Model variant: mac, mag, mal, lmm |
 | `--dim` | `512` | Model dimension |
 | `--num-heads` | `8` | Attention heads |
 | `--num-layers` | `12` | Number of layers |
-| `--dataset` | - | HuggingFace dataset name |
+| `--vocab-size` | `32000` | Vocabulary size |
+| `--chunk-size` | `512` | Chunk size for MAC |
+| `--window-size` | `512` | Window size for MAG/MAL |
+| **Data** |
+| `--dataset` | - | HuggingFace dataset name (streaming) |
+| `--dataset-subset` | - | Dataset subset (e.g., sample-10BT) |
+| `--data` | - | Local text file path |
 | `--tokenizer` | `gpt2` | HuggingFace tokenizer |
+| `--seq-len` | `4096` | Sequence length |
+| **Training** |
+| `--epochs` | `1` | Number of epochs |
+| `--max-steps` | `-1` | Max steps (-1 = use epochs) |
 | `--batch-size` | `4` | Batch size |
-| `--gradient-accumulation-steps` | `32` | Gradient accumulation |
+| `--gradient-accumulation-steps` | `32` | Gradient accumulation steps |
 | `--lr` | `4e-4` | Learning rate |
+| `--weight-decay` | `0.1` | Weight decay |
+| `--grad-clip` | `1.0` | Gradient clipping |
+| `--warmup-ratio` | `0.03` | Warmup ratio |
 | `--dtype` | `float16` | float32, float16, bfloat16 |
+| **Checkpointing** |
+| `--checkpoint-dir` | `checkpoints_mlx/` | Checkpoint directory |
+| `--save-every` | `1000` | Save every N steps |
+| `--eval-every` | `500` | Eval every N steps |
+| `--resume` | - | Resume from checkpoint (.safetensors) |
+| **Logging** |
+| `--log-every` | `10` | Log every N steps |
 | `--wandb` | `False` | Enable W&B logging |
+| `--wandb-project` | `titans-mlx` | W&B project name |
+| `--wandb-run-name` | - | W&B run name |
+| `--seed` | `42` | Random seed |
 
 ---
 
@@ -520,7 +571,30 @@ uv run python scripts/inference.py \
     --temperature 0.8 \
     --top-p 0.9 \
     --max-tokens 200
+
+# With quantization
+uv run python scripts/inference.py \
+    --checkpoint checkpoints/best_model.pt \
+    --prompt "Hello" \
+    --quantize int8
 ```
+
+#### PyTorch Inference Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint` | **required** | Path to model checkpoint (.pt) |
+| `--tokenizer` | `gpt2` | HuggingFace tokenizer |
+| `--prompt` | - | Input prompt |
+| `--max-tokens` | `100` | Max tokens to generate |
+| `--temperature` | `1.0` | Sampling temperature |
+| `--top-k` | `50` | Top-k sampling |
+| `--top-p` | `0.9` | Top-p (nucleus) sampling |
+| `--repetition-penalty` | `1.0` | Repetition penalty |
+| `--interactive` | `False` | Interactive mode |
+| `--stream` | `False` | Stream output token by token |
+| `--quantize` | - | Quantization: int8, int4, fp16 |
+| `--device` | `auto` | Device: auto, cpu, cuda, mps |
 
 ### MLX Inference
 
@@ -535,7 +609,31 @@ uv run python scripts/inference_mlx.py \
 uv run python scripts/inference_mlx.py \
     --checkpoint checkpoints_mlx/best_model.safetensors \
     --interactive
+
+# With quantization and benchmark
+uv run python scripts/inference_mlx.py \
+    --checkpoint checkpoints_mlx/best_model.safetensors \
+    --prompt "Hello" \
+    --quantize 8 \
+    --benchmark
 ```
+
+#### MLX Inference Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--checkpoint` | **required** | Path to model checkpoint (.safetensors) |
+| `--tokenizer` | `gpt2` | HuggingFace tokenizer |
+| `--prompt` | - | Input prompt |
+| `--max-tokens` | `100` | Max tokens to generate |
+| `--temperature` | `1.0` | Sampling temperature |
+| `--top-k` | `50` | Top-k sampling |
+| `--top-p` | `0.9` | Top-p (nucleus) sampling |
+| `--repetition-penalty` | `1.0` | Repetition penalty |
+| `--interactive` | `False` | Interactive mode |
+| `--stream` | `False` | Stream output token by token |
+| `--quantize` | - | Quantization bits: 4 or 8 |
+| `--benchmark` | `False` | Run generation benchmark |
 
 ---
 
