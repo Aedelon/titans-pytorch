@@ -347,12 +347,35 @@ mx.eval(output)
 
 ### PyTorch Pretraining
 
-#### Pre-tokenization (Recommended for Large Datasets)
+#### Option 1: HuggingFace Streaming (Simple, No Setup)
 
-Pre-tokenize your dataset once to eliminate tokenization bottleneck during training:
+Stream directly from HuggingFace - tokenization happens on-the-fly:
 
 ```bash
-# Pre-tokenize FineWeb-Edu
+# Train with FineWeb-Edu streaming
+uv run python scripts/pretrain.py --model mac \
+    --dataset HuggingFaceFW/fineweb-edu \
+    --dataset-subset sample-10BT \
+    --tokenizer NousResearch/Llama-2-7b-hf \
+    --dim 512 --num-layers 12 \
+    --mixed-precision bf16
+
+# Full training (340M params)
+uv run python scripts/pretrain.py --model mac \
+    --dataset HuggingFaceFW/fineweb-edu \
+    --dataset-subset sample-10BT \
+    --tokenizer NousResearch/Llama-2-7b-hf \
+    --dim 1024 --num-layers 24 --num-heads 16 \
+    --batch-size 8 --gradient-accumulation-steps 32 \
+    --lr 4e-4 --mixed-precision bf16 --wandb
+```
+
+#### Option 2: Pre-tokenized Local Dataset (Fastest)
+
+Pre-tokenize once, then train without tokenization overhead:
+
+```bash
+# Step 1: Pre-tokenize (one time)
 uv run python scripts/pretokenize.py \
     --dataset HuggingFaceFW/fineweb-edu \
     --subset sample-10BT \
@@ -361,39 +384,19 @@ uv run python scripts/pretokenize.py \
     --seq-len 4096 \
     --num-proc 8
 
-# Then train with pre-tokenized data (much faster)
+# Step 2: Train with pre-tokenized data
 uv run python scripts/pretrain.py --model mac \
     --local-dataset data/fineweb-tokenized \
     --tokenizer NousResearch/Llama-2-7b-hf \
-    --dim 512 --num-layers 12
+    --dim 512 --num-layers 12 \
+    --mixed-precision bf16
 ```
 
-#### Training Commands
+#### Other Options
 
 ```bash
 # Demo with synthetic data (quick test)
 uv run python scripts/pretrain.py --model mac --dim 256 --epochs 10
-
-# Train with pre-tokenized local dataset (fastest)
-uv run python scripts/pretrain.py --model mac \
-    --local-dataset data/fineweb-tokenized \
-    --tokenizer NousResearch/Llama-2-7b-hf \
-    --dim 512 --num-layers 12
-
-# Train with streaming dataset (no pre-tokenization)
-uv run python scripts/pretrain.py --model mac \
-    --dataset HuggingFaceFW/fineweb-edu \
-    --tokenizer meta-llama/Llama-2-7b-hf \
-    --dim 512 --num-layers 12
-
-# Full training with paper hyperparameters (340M params)
-uv run python scripts/pretrain.py --model mac \
-    --local-dataset data/fineweb-tokenized \
-    --tokenizer NousResearch/Llama-2-7b-hf \
-    --dim 1024 --num-layers 24 --num-heads 16 \
-    --batch-size 8 --gradient-accumulation-steps 32 \
-    --lr 4e-4 --weight-decay 0.1 \
-    --mixed-precision bf16 --wandb
 
 # Train with local text file
 uv run python scripts/pretrain.py --model mag \
